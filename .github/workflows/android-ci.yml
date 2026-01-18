@@ -1,0 +1,230 @@
+name: Android CI (Debug Build)
+
+# Android 免密打包工作流
+# 构建调试版 APK，无需签名，适合日常开发和测试
+
+on:
+  # 手动触发
+  workflow_dispatch:
+  
+  # 当推送到 main 分支时自动构建
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - '.github/workflows/android-ci.yml'
+      - 'apps/readest-app/**'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+
+  # 当创建 Pull Request 时构建
+  pull_request:
+    branches:
+      - main
+      - master
+    paths:
+      - '.github/workflows/android-ci.yml'
+      - 'apps/readest-app/**'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+
+jobs:
+  build-android-debug:
+    # 运行在 Ubuntu 最新版本
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    
+    # 权限配置
+    permissions:
+      contents: read
+      packages: read
+      
+    steps:
+      # 1. 检出代码
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      
+      # 2. 初始化 Git 子模块
+      - name: Initialize git submodules
+        run: git submodule update --init --recursive
+      
+      # 3. 设置 pnpm
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.14.0
+          run_install: false
+      
+      # 4. 设置 Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+          cache-dependency-path: 'pnpm-lock.yaml'
+      
+      # 5. 设置 Java (Android 构建必需)
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+      
+      # 6. 设置 Android SDK
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+      
+      # 7. 安装 Android NDK
+      - name: Install Android NDK
+        run: sdkmanager "ndk;28.2.13676358"
+      
+      # 8. 安装项目依赖
+      - name: Install dependencies
+        run: pnpm install
+      
+      # 9. 复制 vendor 库到 public 目录
+      - name: Copy vendor libraries
+        run: pnpm --filter @readest/readest-app setup-vendors
+      
+      # 10. 设置 Rust
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+          components: rust-src
+      
+      # 11. 缓存 Rust 编译
+      - name: Cache Rust compilation
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android-debug-cargo
+          shared-key: android-debug
+      
+      # 12. 初始化 Android 项目
+      - name: Initialize Android project
+        working-directory: apps/readest-app
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
+        run: |
+          # 删除旧的 Android 项目文件
+          rm -rf src-tauri/gen/android
+          
+          # 重新初始化 Android 项目
+          pnpm tauri android init
+          
+          # 设置应用图标
+          pnpm tauri icon ../../data/icons/readest-book.png
+          
+          # 恢复被修改的文件
+          git checkout .
+      
+      # 13. 构建通用调试版 APK
+      - name: Build universal debug APK
+        working-directory: apps/readest-app
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
+        run: |
+          echo "=== 开始构建通用调试版 APK ==="
+          pnpm tauri android build --debug
+          
+          # 查找生成的 APK 文件
+          APK_DIR="src-tauri/gen/android/app/build/outputs/apk/universal/debug"
+          if [ -d "$APK_DIR" ]; then
+            echo "找到 APK 目录: $APK_DIR"
+            ls -la "$APK_DIR"
+          else
+            echo "警告: 未找到预期目录，搜索 APK 文件..."
+            find src-tauri/gen/android -name "*.apk" -type f
+          fi
+      
+      # 14. 构建 ARM64 调试版 APK
+      - name: Build ARM64 debug APK
+        working-directory: apps/readest-app
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
+        run: |
+          echo "=== 开始构建 ARM64 调试版 APK ==="
+          pnpm tauri android build --debug -t aarch64
+          
+          # 查找生成的 APK 文件
+          APK_DIR="src-tauri/gen/android/app/build/outputs/apk/universal/debug"
+          if [ -d "$APK_DIR" ]; then
+            echo "找到 APK 目录: $APK_DIR"
+            ls -la "$APK_DIR"
+          fi
+      
+      # 15. 收集并重命名 APK 文件
+      - name: Collect APK files
+        working-directory: apps/readest-app
+        id: collect-apks
+        run: |
+          echo "=== 收集生成的 APK 文件 ==="
+          
+          # 获取版本信息
+          VERSION=$(node -p "require('./package.json').version")
+          echo "版本号: $VERSION"
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          
+          # 创建输出目录
+          OUTPUT_DIR="../../apk-output"
+          mkdir -p "$OUTPUT_DIR"
+          
+          # 查找并复制通用 APK
+          UNIVERSAL_APK=$(find src-tauri/gen/android -name "app-universal-debug.apk" -type f | head -1)
+          if [ -n "$UNIVERSAL_APK" ]; then
+            echo "找到通用 APK: $UNIVERSAL_APK"
+            cp "$UNIVERSAL_APK" "$OUTPUT_DIR/Readest_${VERSION}_universal-debug.apk"
+            echo "已复制到: $OUTPUT_DIR/Readest_${VERSION}_universal-debug.apk"
+          else
+            echo "错误: 未找到通用 APK"
+          fi
+          
+          # 查找并复制 ARM64 APK
+          ARM64_APK=$(find src-tauri/gen/android -name "app-aarch64-debug.apk" -type f | head -1)
+          if [ -n "$ARM64_APK" ]; then
+            echo "找到 ARM64 APK: $ARM64_APK"
+            cp "$ARM64_APK" "$OUTPUT_DIR/Readest_${VERSION}_arm64-debug.apk"
+            echo "已复制到: $OUTPUT_DIR/Readest_${VERSION}_arm64-debug.apk"
+          else
+            echo "警告: 未找到 ARM64 APK（这可能是正常的，如果目标架构不匹配）"
+          fi
+          
+          # 列出输出目录内容
+          echo ""
+          echo "=== 输出目录内容 ==="
+          ls -lh "$OUTPUT_DIR"
+      
+      # 16. 上传 APK 文件作为构建产物
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: readest-android-debug
+          path: apk-output/
+          retention-days: 7
+          compression-level: 9
+      
+      # 17. 显示构建结果摘要
+      - name: Build summary
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "🎉 Android 调试版构建完成！"
+          echo "=========================================="
+          echo ""
+          echo "版本号: ${{ env.VERSION }}"
+          echo ""
+          echo "生成的 APK 文件:"
+          ls -lh apk-output/ 2>/dev/null || echo "未找到 APK 文件"
+          echo ""
+          echo "📱 安装说明:"
+          echo "   调试版 APK 可以直接安装到 Android 设备上进行测试"
+          echo "   不需要签名验证，适合开发测试使用"
+          echo ""
+          echo "⚠️  注意事项:"
+          echo "   - 调试版 APK 只能用于开发和测试"
+          echo "   - 不要分发给最终用户"
+          echo "   - 如果需要发布版本，请配置 release 工作流并设置签名密钥"
+          echo "=========================================="
